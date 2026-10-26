@@ -1,0 +1,36 @@
+﻿# Environment variables and secrets
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+
+# Python
+.venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node.js
+node_modules/
+frontend/node_modules/
+
+# Build output
+dist/
+frontend/dist/
+
+# Logs and local files
+*.log
+.DS_Store
+Thumbs.db
+
+# Local backups and temporary files
+*.backup*
+*.bak
+*.tmp
+
+# Local backup folders and TypeScript build metadata
+frontend/backup-*/
+*.tsbuildinfo
+backend/app/*.before_encoding_fix_*
