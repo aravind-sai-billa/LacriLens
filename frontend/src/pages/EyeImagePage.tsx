@@ -1,7 +1,7 @@
 ﻿import { useState } from 'react';
 import AssessmentLayout from './AssessmentLayout';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 
 type ImageAnalysis = {
   status: string;
@@ -187,3 +187,4 @@ export default function EyeImagePage({
     </AssessmentLayout>
   );
 }
+
