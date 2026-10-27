@@ -1,7 +1,9 @@
 import io
+import json
 import logging
+import re
 from html import escape
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +21,7 @@ from reportlab.platypus import (
     Spacer,
     Table,
     TableStyle,
+    PageBreak,
 )
 from PIL import Image, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
@@ -72,6 +75,23 @@ ALLOWED_VIDEO_TYPES = {
 }
 
 
+
+EyeState = Literal["OPEN", "PARTIALLY_CLOSED", "CLOSED", "UNCERTAIN"]
+
+
+class BlinkObservation(BaseModel):
+    timestamp_seconds: float = Field(ge=0, le=60)
+    state: EyeState
+
+
+class BlinkAnalysis(BaseModel):
+    clip_duration_seconds: float | None = Field(default=None, gt=0, le=60)
+    blink_count: int | None = Field(default=None, ge=0)
+    observations: list[BlinkObservation] = Field(default_factory=list)
+    quality_notes: list[str] = Field(default_factory=list)
+    analysis_text: str = ""
+
+
 class ReportRequest(BaseModel):
     assessments: dict[str, Any] = Field(min_length=1)
     disclaimer: str = (
@@ -104,7 +124,7 @@ def require_gemini_configuration() -> None:
 
 
 def generate_gemini_text(prompt: str, data: bytes, mime_type: str) -> str:
-    """Call Gemini server-side. The API key is never sent to the browser."""
+    """Call Gemini server-side; video requests use supported 24 FPS sampling."""
     require_gemini_configuration()
 
     try:
@@ -118,18 +138,35 @@ def generate_gemini_text(prompt: str, data: bytes, mime_type: str) -> str:
             ),
         )
 
-        response = client.models.generate_content(
-            model=settings.gemini_model,
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=data, mime_type=mime_type),
-            ],
-        )
+        if mime_type in ALLOWED_VIDEO_TYPES:
+            # Gemini's video_metadata.fps is limited to 24. This controls
+            # the requested video-frame sampling rate; it does not claim
+            # that the source file itself was recorded at 24 FPS.
+            video_part = types.Part(
+                inline_data=types.Blob(data=data, mime_type=mime_type),
+                video_metadata=types.VideoMetadata(fps=24),
+            )
+            response = client.models.generate_content(
+                model=settings.gemini_model,
+                contents=[types.Part(text=prompt), video_part],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                ),
+            )
+        else:
+            response = client.models.generate_content(
+                model=settings.gemini_model,
+                contents=[
+                    prompt,
+                    types.Part.from_bytes(data=data, mime_type=mime_type),
+                ],
+            )
 
-        text = (response.text or "").strip()
-        if not text:
+        result_text = (response.text or "").strip()
+        if not result_text:
             raise RuntimeError("Gemini returned an empty response.")
-        return text
+        return result_text
 
     except HTTPException:
         raise
@@ -208,7 +245,7 @@ Clearly label your response as AI-assisted observations, not a diagnosis.
 
 @app.post("/api/analyze-closure")
 async def analyze_closure(file: UploadFile = File(...)):
-    """Return qualitative video observations and cautious blink-rate estimates."""
+    """Analyze a short eye video and return cautious blink estimates."""
     if file.content_type not in ALLOWED_VIDEO_TYPES:
         raise HTTPException(
             status_code=415,
@@ -216,64 +253,108 @@ async def analyze_closure(file: UploadFile = File(...)):
         )
 
     data = await read_upload_limited(file)
+    require_gemini_configuration()
 
     prompt = """
-You are analyzing a short eye video for a non-diagnostic screening prototype.
+Analyze this short eye video for a non-diagnostic blink estimate.
+Return JSON with these fields:
+- clip_duration_seconds: number or null
+- blink_count: non-negative integer or null
+- observations: list of objects with timestamp_seconds and state
+- quality_notes: list of strings
+- analysis_text: string
 
-Carefully inspect the supplied video. Return these sections in plain text:
-
-BLINK COUNT ESTIMATE:
-Give an integer only if you can reasonably identify complete blinks.
-Otherwise write: Unable to estimate reliably.
-
-BLINK RATE ESTIMATE:
-If a reliable count is available and the clip duration can reasonably be
-established, estimate blinks per minute using:
-blink rate = estimated blink count / video duration in seconds * 60.
-For a verified 10-second clip, this is count * 6, NOT count * 3.
-If duration or count is uncertain, explain the limitation and do not invent
-a numeric rate.
-
-VIDEO QUALITY AND LIMITATIONS:
-Describe whether the eyes are visible, whether the face is obstructed,
-and any relevant video-quality limitations.
-
-VISIBLE OBSERVATIONS:
-Describe only what can reasonably be observed.
-
-CONFIDENCE:
-State low, moderate, or high confidence and briefly explain why.
-
-DISCLAIMER:
-State that this is an AI estimate, not a validated clinical measurement
-or a diagnosis.
-
-Never claim that a count is exact when it is uncertain. Do not diagnose
-dry eye or any other condition. If you cannot reliably count blinks,
-say so explicitly rather than guessing.
+Count only complete blinks (closure followed by reopening).
+Never invent blinks, timestamps, or duration.
+Use states OPEN, PARTIALLY_CLOSED, CLOSED, or UNCERTAIN.
+If the count is unreliable, return null for blink_count and explain why.
+This is an experimental estimate, not a validated clinical measurement.
 """
 
-    result = await run_in_threadpool(
-        generate_gemini_text,
-        prompt,
-        data,
-        file.content_type,
-    )
+    try:
+        raw = await run_in_threadpool(
+            generate_gemini_text, prompt, data, file.content_type
+        )
+        raw = raw.strip()
+        if not raw:
+            raise ValueError("Gemini returned an empty response.")
 
-    return {
-        "status": "success",
-        "assessment": "video_eye_closure",
-        "model": settings.gemini_model,
-        "result": result,
-        "blink_count": None,
-        "blink_rate_bpm": None,
-        "blink_metrics_status": "text_estimate_requires_review",
-        "is_diagnosis": False,
-    }
+        # Accept JSON, including responses wrapped in Markdown fences.
+        cleaned = re.sub(
+            r"^\s*```(?:json)?\s*", "", raw, flags=re.IGNORECASE
+        )
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
 
-import json
-import re
-from reportlab.platypus import PageBreak
+        try:
+            analysis = BlinkAnalysis.model_validate_json(cleaned)
+        except Exception:
+            # Preserve text-only compatibility, but do not fabricate metrics.
+            return {
+                "status": "success",
+                "assessment": "video_eye_closure",
+                "model": settings.gemini_model,
+                "result": raw,
+                "blink_count": None,
+                "blink_rate_bpm": None,
+                "blink_metrics_status": "text_estimate_requires_review",
+                "clip_duration_seconds": None,
+                "observations": [],
+                "quality_notes": [
+                    "Structured blink metrics were not returned; "
+                    "review the video and analysis manually."
+                ],
+                "is_diagnosis": False,
+            }
+
+        count = analysis.blink_count
+        duration = analysis.clip_duration_seconds
+
+        # Never divide by zero or report a rate for an invalid duration.
+        valid_duration = duration is not None and duration > 0
+        bpm = (
+            round(count / duration * 60, 1)
+            if count is not None and valid_duration
+            else None
+        )
+
+        result_text = analysis.analysis_text.strip() or (
+            "Review the blink observations and quality notes. "
+            "This is not a clinical measurement."
+        )
+
+        return {
+            "status": "success",
+            "assessment": "video_eye_closure",
+            "model": settings.gemini_model,
+            "result": result_text,
+            "blink_count": count,
+            "blink_rate_bpm": bpm,
+            "blink_metrics_status": (
+                "estimate_available"
+                if count is not None and bpm is not None
+                else "uncertain_or_unavailable"
+            ),
+            "clip_duration_seconds": duration,
+            "observations": [
+                item.model_dump() for item in analysis.observations
+            ],
+            "quality_notes": analysis.quality_notes,
+            "is_diagnosis": False,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Gemini video analysis failed: %s", type(exc).__name__
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini video analysis failed. Check backend logs "
+                "and model configuration, then retry."
+            ),
+        ) from exc
 
 
 def _report_escape(value: Any) -> str:
@@ -317,21 +398,19 @@ def _osdi_category(score_value: Any) -> dict:
         return {"score": None, "category": "Invalid score", "range": "N/A"}
 
     if score <= 12:
-        category, score_range = "Normal / minimal symptoms", "0–12"
+        category, score_range = "Normal / minimal symptoms", "0-12"
     elif score <= 22:
-        category, score_range = "Mild symptoms", "13–22"
+        category, score_range = "Mild symptoms", "13-22"
     elif score <= 32:
-        category, score_range = "Moderate symptoms", "23–32"
+        category, score_range = "Moderate symptoms", "23-32"
     else:
-        category, score_range = "Severe symptoms", "33–100"
+        category, score_range = "Severe symptoms", "33-100"
 
     return {"score": score, "category": category, "range": score_range}
 
 
 def generate_gemini_report_interpretation(assessments: dict) -> dict:
-    """Use Gemini for patient-facing explanations and tailored suggestions."""
-    require_gemini_configuration()
-
+    """Use Gemini for patient-facing explanations; fall back if unavailable."""
     payload = json.dumps(assessments, ensure_ascii=False, default=str)
     if len(payload) > 45000:
         raise HTTPException(
@@ -383,6 +462,11 @@ ASSESSMENT DATA:
 """
 
     try:
+        # PDF creation must remain available even when Gemini is temporarily
+        # unavailable or the API key/model has not been configured.
+        if not settings.gemini_api_key or not settings.gemini_model:
+            raise RuntimeError("Gemini report interpretation is not configured.")
+
         from google import genai
         from google.genai import types
 
@@ -473,28 +557,21 @@ ASSESSMENT DATA:
 
 def _report_card(story, title: str, body: str, styles,
                  background="#F3F7FA"):
-    content = [
-        Paragraph(escape(title), styles["CardTitle"]),
-        Paragraph(body or "Not provided.", styles["BodyText"]),
-    ]
-    table = Table([[content]], colWidths=[170 * mm])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(background)),
-        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#D7DEE8")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 10),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 9),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 9),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    story.append(table)
+    """Add page-splittable report content.
+
+    Avoid wrapping long paragraphs in a single-cell Table: ReportLab cannot
+    split an oversized table row across pages and raises LayoutError.
+    The background parameter is retained for call-site compatibility.
+    """
+    story.append(Paragraph(escape(title), styles["CardTitle"]))
+    story.append(Paragraph(body or "Not provided.", styles["BodyText"]))
     story.append(Spacer(1, 3 * mm))
 
 
 def _report_bullets(items) -> str:
     if not items:
         return "No additional points were provided."
-    return "<br/>".join("• " + _report_escape(item) for item in items)
+    return "<br/>".join("&#8226; " + _report_escape(item) for item in items)
 
 
 @app.post("/api/generate-report")
@@ -594,8 +671,8 @@ def generate_report(request: ReportRequest):
         "#EDF6F5",
     )
     story.append(Paragraph(
-        "LacriLens OSDI bands: 0–12 normal/minimal, 13–22 mild, "
-        "23–32 moderate, 33–100 severe symptoms. These are symptom categories, "
+        "LacriLens OSDI bands: 0-12 normal/minimal, 13-22 mild, "
+        "23-32 moderate, 33-100 severe symptoms. These are symptom categories, "
         "not a confirmed diagnosis.",
         styles["SmallNote"],
     ))
@@ -680,4 +757,3 @@ def generate_report(request: ReportRequest):
             "Content-Disposition": 'attachment; filename="lacrilens-report.pdf"'
         },
     )
-
