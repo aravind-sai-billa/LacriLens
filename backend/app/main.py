@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import re
+import time
 from html import escape
 from typing import Any, Literal
 
@@ -124,7 +125,7 @@ def require_gemini_configuration() -> None:
 
 
 def generate_gemini_text(prompt: str, data: bytes, mime_type: str) -> str:
-    """Call Gemini server-side; video requests use supported 24 FPS sampling."""
+    """Call Gemini with retries for temporary API availability errors."""
     require_gemini_configuration()
 
     try:
@@ -138,45 +139,102 @@ def generate_gemini_text(prompt: str, data: bytes, mime_type: str) -> str:
             ),
         )
 
-        if mime_type in ALLOWED_VIDEO_TYPES:
-            # Gemini's video_metadata.fps is limited to 24. This controls
-            # the requested video-frame sampling rate; it does not claim
-            # that the source file itself was recorded at 24 FPS.
-            video_part = types.Part(
-                inline_data=types.Blob(data=data, mime_type=mime_type),
-                video_metadata=types.VideoMetadata(fps=24),
-            )
-            response = client.models.generate_content(
-                model=settings.gemini_model,
-                contents=[types.Part(text=prompt), video_part],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                ),
-            )
-        else:
-            response = client.models.generate_content(
-                model=settings.gemini_model,
-                contents=[
-                    prompt,
-                    types.Part.from_bytes(data=data, mime_type=mime_type),
-                ],
-            )
+        for attempt in range(4):
+            try:
+                if mime_type in ALLOWED_VIDEO_TYPES:
+                    # Preserve the existing video-analysis behavior.
+                    video_part = types.Part(
+                        inline_data=types.Blob(
+                            data=data,
+                            mime_type=mime_type,
+                        ),
+                        video_metadata=types.VideoMetadata(fps=24),
+                    )
+                    response = client.models.generate_content(
+                        model=settings.gemini_model,
+                        contents=[types.Part(text=prompt), video_part],
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.0,
+                        ),
+                    )
+                else:
+                    response = client.models.generate_content(
+                        model=settings.gemini_model,
+                        contents=[
+                            prompt,
+                            types.Part.from_bytes(
+                                data=data,
+                                mime_type=mime_type,
+                            ),
+                        ],
+                    )
 
-        result_text = (response.text or "").strip()
-        if not result_text:
-            raise RuntimeError("Gemini returned an empty response.")
-        return result_text
+                result_text = (response.text or "").strip()
+                if not result_text:
+                    raise RuntimeError("Gemini returned an empty response.")
+                return result_text
+
+            except Exception as exc:
+                status_code = (
+                    getattr(exc, "code", None)
+                    or getattr(exc, "status_code", None)
+                )
+                error_text = str(exc).upper()
+                retryable = (
+                    status_code in {429, 500, 502, 503, 504}
+                    or any(
+                        marker in error_text
+                        for marker in (
+                            "503 UNAVAILABLE",
+                            "500 INTERNAL",
+                            "502 BAD GATEWAY",
+                            "504 DEADLINE",
+                            "429 RESOURCE_EXHAUSTED",
+                            "UNAVAILABLE",
+                            "RESOURCE_EXHAUSTED",
+                        )
+                    )
+                )
+
+                # Four attempts total, with delays of 2, 4, and 8 seconds.
+                if retryable and attempt < 3:
+                    delay = 2 ** (attempt + 1)
+                    logger.warning(
+                        "Temporary Gemini error on attempt %s/4. "
+                        "Retrying in %s seconds. Error type: %s",
+                        attempt + 1,
+                        delay,
+                        type(exc).__name__,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                logger.exception(
+                    "Gemini request failed on attempt %s/4: %s",
+                    attempt + 1,
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Gemini analysis is temporarily unavailable "
+                        "or failed. Please wait and retry."
+                    ),
+                ) from exc
 
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Gemini request failed: %s", type(exc).__name__)
+        logger.exception(
+            "Gemini client initialization failed: %s",
+            type(exc).__name__,
+        )
         raise HTTPException(
             status_code=502,
             detail=(
-                "Gemini analysis failed. Check backend logs and model "
-                "configuration, then retry."
+                "Gemini could not be reached. Check backend logs "
+                "and configuration, then retry."
             ),
         ) from exc
 
@@ -410,7 +468,7 @@ def _osdi_category(score_value: Any) -> dict:
 
 
 def generate_gemini_report_interpretation(assessments: dict) -> dict:
-    """Use Gemini for patient-facing explanations; fall back if unavailable."""
+    """Use Gemini for patient-facing explanations and tailored suggestions."""
     payload = json.dumps(assessments, ensure_ascii=False, default=str)
     if len(payload) > 45000:
         raise HTTPException(
@@ -462,11 +520,6 @@ ASSESSMENT DATA:
 """
 
     try:
-        # PDF creation must remain available even when Gemini is temporarily
-        # unavailable or the API key/model has not been configured.
-        if not settings.gemini_api_key or not settings.gemini_model:
-            raise RuntimeError("Gemini report interpretation is not configured.")
-
         from google import genai
         from google.genai import types
 
@@ -557,12 +610,9 @@ ASSESSMENT DATA:
 
 def _report_card(story, title: str, body: str, styles,
                  background="#F3F7FA"):
-    """Add page-splittable report content.
-
-    Avoid wrapping long paragraphs in a single-cell Table: ReportLab cannot
-    split an oversized table row across pages and raises LayoutError.
-    The background parameter is retained for call-site compatibility.
-    """
+    """Add report content that can split naturally across pages."""
+    # Keep the parameter for compatibility with existing call sites.
+    # Avoid a single-cell table, which cannot split oversized content safely.
     story.append(Paragraph(escape(title), styles["CardTitle"]))
     story.append(Paragraph(body or "Not provided.", styles["BodyText"]))
     story.append(Spacer(1, 3 * mm))
